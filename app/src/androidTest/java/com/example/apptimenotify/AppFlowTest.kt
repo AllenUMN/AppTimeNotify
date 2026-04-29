@@ -12,7 +12,7 @@ import androidx.test.platform.app.InstrumentationRegistry
 import org.junit.Before
 
 @RunWith(AndroidJUnit4::class)
-class AppSearchTest {
+class AppFlowTest {
 
     @get:Rule
     val composeTestRule = createAndroidComposeRule<MainActivity>()
@@ -27,34 +27,40 @@ class AppSearchTest {
 
     @OptIn(ExperimentalTestApi::class)
     @Test
-    fun testSearchAndSelectApp() {
-        // 1. Wait for idle to ensure the activity is fully started
+    fun testFullFlow() {
+        // 1. Wait for idle
         composeTestRule.waitForIdle()
 
-        // 2. Wait for the loading to finish by waiting for the search bar to be ENABLED
+        // 2. Wait for the loading to finish
         composeTestRule.waitUntil(timeoutMillis = 15000) {
             composeTestRule.onAllNodes(hasTestTag("search_bar") and isEnabled())
                 .fetchSemanticsNodes().isNotEmpty()
         }
         
-        composeTestRule.onNodeWithTag("search_bar")
-            .assertIsDisplayed()
-            .assertIsEnabled()
-
-        // 3. Type "a" to filter the list
-        composeTestRule.onNodeWithTag("search_bar")
-            .performTextInput("a")
-
-        // 4. Wait for the list to be populated
-        composeTestRule.waitUntilAtLeastOneExists(hasTestTag("app_item"), timeoutMillis = 5000)
-
-        // 5. Click the first app item
+        // 3. Click on an app item
         composeTestRule.onAllNodes(hasTestTag("app_item"))
             .onFirst()
             .performClick()
 
-        // 6. Verify that we navigated to the time limit screen
+        // 4. Verify we are on the Time Limit Screen
         composeTestRule.onNodeWithText("Set limit for", substring = true)
             .assertIsDisplayed()
+
+        // 5. Enter hours and minutes
+        composeTestRule.onNodeWithTag("hours_input").performTextInput("1")
+        composeTestRule.onNodeWithTag("minutes_input").performTextInput("30")
+
+        // 6. Click Confirm
+        composeTestRule.onNodeWithTag("confirm_button").performClick()
+
+        // 7. Verify we are back on the list screen and tracking is active
+        composeTestRule.onNodeWithText("Tracking:", substring = true).assertIsDisplayed()
+        composeTestRule.onNodeWithText("Limit: 1h 30m per day").assertIsDisplayed()
+
+        // 8. Stop tracking
+        composeTestRule.onNodeWithText("Stop Tracking").performClick()
+
+        // 9. Verify tracking card is gone
+        composeTestRule.onNodeWithText("Tracking:", substring = true).assertDoesNotExist()
     }
 }

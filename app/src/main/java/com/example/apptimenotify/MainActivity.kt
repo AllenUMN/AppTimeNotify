@@ -1,9 +1,13 @@
 package com.example.apptimenotify
 
+import android.app.AppOpsManager
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.drawable.Drawable
+import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -22,9 +26,20 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.core.graphics.drawable.toBitmap
+import androidx.navigation.NavType
+import androidx.navigation.compose.NavHost
+import androidx.navigation.compose.composable
+import androidx.navigation.compose.rememberNavController
+import androidx.navigation.navArgument
 import com.example.apptimenotify.ui.theme.AppTimeNotifyTheme
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import androidx.compose.runtime.collectAsState
+import androidx.core.content.ContextCompat
+import android.Manifest
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 
 data class AppInfo(
     val name: String,
@@ -38,22 +53,149 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         setContent {
             AppTimeNotifyTheme {
+                val navController = rememberNavController()
+                var showPermissionDialog by remember { mutableStateOf(false) }
+                val context = LocalContext.current
+
+                // Request notification permission for Android 13+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    val launcher = rememberLauncherForActivityResult(
+                        ActivityResultContracts.RequestPermission()
+                    ) { isGranted ->
+                        if (!isGranted) {
+                            Log.w("MainActivity", "Notification permission denied")
+                        }
+                    }
+                    SideEffect {
+                        if (ContextCompat.checkSelfPermission(
+                                context,
+                                Manifest.permission.POST_NOTIFICATIONS
+                            ) != PackageManager.PERMISSION_GRANTED
+                        ) {
+                            launcher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                        }
+                    }
+                }
+
+                // Re-check permission on every resume to dismiss dialog correctly
+                DisposableEffect(Unit) {
+                    if (!hasUsageStatsPermission(context)) {
+                        showPermissionDialog = true
+                    }
+                    onDispose { }
+                }
+
+                // Better way to handle resume check in Compose
+                val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+                DisposableEffect(lifecycleOwner) {
+                    val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+                        if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                            if (hasUsageStatsPermission(context)) {
+                                showPermissionDialog = false
+                            } else {
+                                showPermissionDialog = true
+                            }
+                        }
+                    }
+                    lifecycleOwner.lifecycle.addObserver(observer)
+                    onDispose {
+                        lifecycleOwner.lifecycle.removeObserver(observer)
+                    }
+                }
+
+                if (showPermissionDialog) {
+                    AlertDialog(
+                        onDismissRequest = { },
+                        title = { Text("Permission Required") },
+                        text = { Text("This app needs Usage Access to monitor your app usage. Please enable it in the settings.") },
+                        confirmButton = {
+                            Button(onClick = {
+                                showPermissionDialog = false
+                                startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+                            }) {
+                                Text("Go to Settings")
+                            }
+                        }
+                    )
+                }
+
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-                    AppListScreen(modifier = Modifier.padding(innerPadding))
+                    NavHost(
+                        navController = navController,
+                        startDestination = "app_list",
+                        modifier = Modifier.padding(innerPadding)
+                    ) {
+                        composable("app_list") {
+                            AppListScreen(
+                                onAppSelected = { packageName, appName ->
+                                    navController.navigate("time_limit/$packageName/$appName")
+                                }
+                            )
+                        }
+                        composable(
+                            "time_limit/{packageName}/{appName}",
+                            arguments = listOf(
+                                navArgument("packageName") { type = NavType.StringType },
+                                navArgument("appName") { type = NavType.StringType }
+                            )
+                        ) { backStackEntry ->
+                            val packageName = backStackEntry.arguments?.getString("packageName") ?: ""
+                            val appName = backStackEntry.arguments?.getString("appName") ?: ""
+                            TimeLimitScreen(
+                                packageName = packageName,
+                                appName = appName,
+                                onConfirmed = {
+                                    // Start the tracking service
+                                    val intent = Intent(this@MainActivity, AppUsageService::class.java)
+                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                        startForegroundService(intent)
+                                    } else {
+                                        startService(intent)
+                                    }
+                                    navController.popBackStack()
+                                },
+                                onBack = { navController.popBackStack() }
+                            )
+                        }
+                    }
                 }
             }
         }
     }
 }
 
+@Suppress("DEPRECATION")
+fun hasUsageStatsPermission(context: Context): Boolean {
+    val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
+    val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        appOps.unsafeCheckOpNoThrow(
+            AppOpsManager.OPSTR_GET_USAGE_STATS,
+            android.os.Process.myUid(),
+            context.packageName
+        )
+    } else {
+        appOps.checkOpNoThrow(
+            AppOpsManager.OPSTR_GET_USAGE_STATS,
+            android.os.Process.myUid(),
+            context.packageName
+        )
+    }
+    return mode == AppOpsManager.MODE_ALLOWED
+}
+
 @Composable
-fun AppListScreen(modifier: Modifier = Modifier) {
+fun AppListScreen(
+    modifier: Modifier = Modifier,
+    onAppSelected: (String, String) -> Unit
+) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var searchQuery by remember { mutableStateOf("") }
-    var selectedAppName by remember { mutableStateOf<String?>(null) }
     var allApps by remember { mutableStateOf<List<AppInfo>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
+    
+    val currentLimit by UsagePrefs.getAppLimit(context).collectAsState(initial = null)
     
     // Load apps asynchronously
     LaunchedEffect(Unit) {
@@ -76,16 +218,33 @@ fun AppListScreen(modifier: Modifier = Modifier) {
     }
 
     Column(modifier = modifier.fillMaxSize().padding(16.dp)) {
-        if (selectedAppName != null) {
-            Text(
-                text = "Selected: $selectedAppName",
-                style = MaterialTheme.typography.headlineSmall,
-                modifier = Modifier.padding(bottom = 8.dp)
-            )
-            Button(onClick = { selectedAppName = null }) {
-                Text("Clear Selection")
+        if (currentLimit != null) {
+            Card(
+                modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text(
+                        text = "Tracking: ${currentLimit!!.appName}",
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                    Text(
+                        text = "Limit: ${currentLimit!!.hours}h ${currentLimit!!.minutes}m per day",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    Button(
+                        onClick = { 
+                            scope.launch {
+                                UsagePrefs.clearLimit(context)
+                                context.stopService(Intent(context, AppUsageService::class.java))
+                            }
+                        },
+                        modifier = Modifier.padding(top = 8.dp)
+                    ) {
+                        Text("Stop Tracking")
+                    }
+                }
             }
-            Spacer(modifier = Modifier.height(16.dp))
         }
 
         OutlinedTextField(
@@ -118,7 +277,7 @@ fun AppListScreen(modifier: Modifier = Modifier) {
                 LazyColumn(modifier = Modifier.weight(1f).testTag("app_list")) {
                     items(filteredApps) { app ->
                         AppItem(app = app) {
-                            selectedAppName = app.name
+                            onAppSelected(app.packageName, app.name)
                         }
                     }
                 }
